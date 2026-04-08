@@ -20,6 +20,7 @@ API=https://openrouter.ai/api/v1/chat/completions
 API_KEY=
 MAX_TURNS=25
 CONFIRM=1
+REWRITE=1
 EOF
 fi
 
@@ -31,6 +32,7 @@ MODEL="${MODEL:-openai/gpt-5.4-mini}"
 API="${API:-https://openrouter.ai/api/v1/chat/completions}"
 MAX_TURNS="${MAX_TURNS:-25}"
 CONFIRM="${SHOOP_CONFIRM:-${CONFIRM:-1}}"
+REWRITE="${SHOOP_REWRITE:-${REWRITE:-1}}"
 API_KEY="${SHOOP_API_KEY:-${API_KEY:-${OPENROUTER_API_KEY:-${ZAI_API_KEY:-}}}}"
 if [[ -z "$API_KEY" ]]; then
   echo "error: no API key set. Use API_KEY in config, SHOOP_API_KEY, OPENROUTER_API_KEY, or ZAI_API_KEY env var." >&2
@@ -125,9 +127,50 @@ while [[ $# -gt 0 ]]; do
     --api)    API="${2:?--api requires a value}"; shift 2 ;;
     --key)    API_KEY="${2:?--key requires a value}"; shift 2 ;;
     --zai)    API="https://api.z.ai/api/coding/paas/v4/chat/completions"; API_KEY="${ZAI_API_KEY:-$API_KEY}"; shift ;;
+    --no-rewrite) REWRITE=0; shift ;;
     *)        break ;;
   esac
 done
+
+# --- prompt rewriter ---
+rewrite_system='You rewrite user prompts for a coding agent using CRISP. Output ONLY the enhanced prompt — no labels, no commentary, no markdown fences.
+
+For each missing dimension, infer and add it:
+C (Context): working directory, language, domain constraints
+R (Role): expertise needed (e.g. "senior Go developer")
+I (Instructions): decompose into numbered steps with acceptance criteria
+S (Specifications): format, constraints, output shape
+P (Patterns): one concrete example of desired behavior
+
+Rules:
+- Preserve the original intent exactly — enhance clarity, do not change the ask
+- No placeholders like [INSERT X] — fill everything with inferred values
+- If the prompt is already specific (3+ dimensions present), make only minimal improvements
+- Keep it under 200 words
+- Write as a direct instruction, not a description of what a good prompt would look like'
+
+rewrite_prompt() {
+  local raw_prompt="$1"
+  local rw_system rw_encoded rw_msgs rw_resp rw_text
+  rw_system=$(printf '%s' "$rewrite_system" | jq -Rs .)
+  rw_encoded=$(printf '%s' "$raw_prompt" | jq -Rs .)
+  rw_msgs="[{\"role\":\"system\",\"content\":$rw_system},{\"role\":\"user\",\"content\":$rw_encoded}]"
+
+  rw_resp=$(curl -s "$API" \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model":"'"$MODEL"'",
+      "messages":'"$rw_msgs"',
+      "max_tokens": 400
+    }') || return 1
+
+  rw_text=$(printf '%s' "$rw_resp" | jq -r '.choices[0].message.content // empty')
+  if [[ -z "$rw_text" ]]; then
+    return 1
+  fi
+  printf '%s' "$rw_text"
+}
 
 # --- subcommands ---
 case "${1:-}" in
@@ -181,6 +224,7 @@ case "${1:-}" in
     echo "  --api URL      API base URL (default: from config)"
     echo "  --key KEY      API key (default: from config/env)"
     echo "  --zai          shortcut for z.ai coding plan endpoint"
+    echo "  --no-rewrite   skip CRISP prompt rewriting"
     echo ""
     echo "env: SHOOP_API_KEY, OPENROUTER_API_KEY, or ZAI_API_KEY"
     echo "     SHOOP_CONFIRM=0 (skip prompts)"
@@ -196,7 +240,19 @@ case "${1:-}" in
     ;;
   *)
     # normal prompt mode
-    prompt=$(printf '%s' "$1" | jq -Rs .)
+    raw_input="$1"
+    if [ "$REWRITE" = "1" ]; then
+      if enhanced=$(rewrite_prompt "$raw_input"); then
+        echo "--- prompt rewritten ---"
+        echo "$enhanced"
+        echo "---"
+        echo ""
+        raw_input="$enhanced"
+      else
+        echo "warning: prompt rewrite failed, using original prompt" >&2
+      fi
+    fi
+    prompt=$(printf '%s' "$raw_input" | jq -Rs .)
     system=$(printf '%s' "$system_prompt" | jq -Rs .)
     messages="[{\"role\":\"system\",\"content\":$system},{\"role\":\"user\",\"content\":$prompt}]"
     echo "--- shoop started session $SESSION_ID (model: $MODEL) ---"
