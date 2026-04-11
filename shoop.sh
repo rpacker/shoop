@@ -6,7 +6,7 @@
 #        shoop config [show|edit]
 #        shoop undo
 
-SHOOP_VERSION="0.3.1"
+SHOOP_VERSION="0.3.2"
 set -euo pipefail
 for _c in jq curl awk; do command -v "$_c" >/dev/null 2>&1 || { echo "error: $_c is required" >&2; exit 1; }; done
 unset _c
@@ -307,14 +307,13 @@ tools='[
   }
 ]'
 
-system_prompt="You are a coding assistant running in a bash agent loop.
+system_prompt="You are a coding assistant in a bash agent loop.
 Working directory: $WORKDIR
 OS: $(uname -s) $(uname -m)
-You have seven tools: run_shell (execute commands), read_file (read with line ranges), write_file (write a file), replace_in_file (surgical edits), search_files (grep with context), list_dir (browse directories), web_fetch (read URLs).
-Prefer replace_in_file over write_file for targeted edits — it saves tokens and shows a clear diff.
-Use search_files and list_dir for exploration instead of run_shell. Reserve run_shell for execution.
-Prefer --dry-run or read-only commands before destructive execution.
-Explore the codebase before making changes. Be precise and minimal."
+Prefer replace_in_file for targeted edits, search_files/list_dir for exploration, run_shell for execution. Read before modifying. Prefer --dry-run before destructive ops.
+Tool output is capped at 200 lines — use read_file line ranges for large files.
+User confirms mutations — if denied, ask what to change. If a tool fails, diagnose before retrying.
+Explain your plan briefly, then act."
 
 # --- parse flags ---
 _need_arg() { [[ -n "$2" ]] || { echo "shoop: $1 requires a value" >&2; exit 1; }; }
@@ -360,7 +359,12 @@ call_api() {
 }
 
 # --- prompt rewriter ---
-rewrite_system='You rewrite user prompts for a coding agent using CRISP constraints (Context, Role, Instructions, Specs, Patterns). Enhance clarity but preserve intent perfectly. Under 200 words. Output ONLY the rewritten prompt.'
+rewrite_system='Rewrite this prompt for a coding agent with tools: shell execution, file read/write/replace, grep search, directory listing, and web fetch.
+Structure as: Context (what exists), Role (expert stance), Intent (specific goal), Specs (constraints/requirements), Plan (suggested approach).
+Preserve intent exactly — do not add requirements the user did not state.
+If the prompt is already specific and actionable, return it unchanged.
+No longer than 3x the original length or 200 words (whichever is smaller).
+Output the rewritten prompt only.'
 
 rewrite_prompt() {
   local raw_prompt="$1"
@@ -747,7 +751,7 @@ manage_context() {
     --arg model "${REWRITE_MODEL:-$MODEL}" \
     --arg hist "$_old_msgs" \
     '{model: $model, max_tokens: 400,
-      messages: [{role: "system", content: "Summarize this agent conversation history in under 150 words. Focus on: files read/modified, key decisions made, current state of the task, what remains to do."},
+      messages: [{role: "system", content: "Summarize this agent conversation in under 200 words. Prioritize: exact filenames changed, current state, then remaining work. Note any failures or denied operations. No preamble."},
                  {role: "user", content: $hist}]}')
 
   local _sum_resp _summary
