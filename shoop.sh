@@ -6,7 +6,7 @@
 #        shoop config [show|edit]
 #        shoop undo
 
-SHOOP_VERSION="0.3.2"
+SHOOP_VERSION="0.3.3"
 set -euo pipefail
 for _c in jq curl awk; do command -v "$_c" >/dev/null 2>&1 || { echo "error: $_c is required" >&2; exit 1; }; done
 unset _c
