@@ -172,9 +172,9 @@ require_path() {
 }
 
 is_binary() {
-  local p="$1" enc
-  enc=$(file -b --mime-encoding "$p" 2>/dev/null) && [[ "$enc" == "binary" ]] && return 0 || true
-  enc=$(file -I "$p" 2>/dev/null) && [[ "$enc" == *"charset=binary"* ]] && return 0 || true
+  local p="$1"
+  [[ "$(file -b --mime-encoding "$p" 2>/dev/null)" == "binary" ]] && return 0
+  [[ "$(file -I "$p" 2>/dev/null)" == *"charset=binary"* ]] && return 0
   return 1
 }
 
@@ -332,14 +332,16 @@ done
 
 # --- api ---
 call_api() {
-  local payload="$1" resp http_code body auth_file
+  local payload="$1" resp http_code body auth_file api_error
+  # auth_file holds the bearer header so the API key never appears in process args.
+  # Cleaned up immediately after curl completes — no RETURN trap (which leaks globally).
   auth_file=$(mktemp)
-  trap 'rm -f "$auth_file"' RETURN
   printf 'Authorization: Bearer %s' "$API_KEY" > "$auth_file"
   resp=$(curl -s -w '\n%{http_code}' "$API" \
     -H @"$auth_file" \
     -H "Content-Type: application/json" \
     -d "$payload")
+  rm -f "$auth_file"
   http_code="${resp##*$'\n'}"
   body="${resp%$'\n'"$http_code"}"
 
@@ -348,7 +350,6 @@ call_api() {
     return 1
   fi
 
-  local api_error
   api_error=$(printf '%s' "$body" | jq -r '.error.message // empty')
   if [ -n "$api_error" ]; then
     echo "API error: $api_error" >&2
@@ -499,7 +500,7 @@ case "${1:-}" in
       SESSION_ID="${SESSION_ID%%--*}"
     fi
     messages=$(cat "$session_file")
-    echo "--- resumed ${SESSION_ID%%--*} (model: $MODEL) ---"
+    echo "--- resumed $SESSION_ID (model: $MODEL) ---"
     # show last assistant message as preview
     _last=$(printf '%s' "$messages" | jq -r '[.[] | select(.role == "assistant") | .content // empty] | last // empty')
     if [[ -n "$_last" ]]; then
@@ -580,20 +581,17 @@ HELP
     exit 1
     ;;
   *)
-    # catch likely command typos — bare lowercase word resembling a known command
+    # catch likely command typos — only on strict prefix truncation (e.g. "sess" → "sessions")
+    # Earlier heuristic (same-first-3 within ±2) false-positived on words like "helper" → "help".
     if [[ "$1" =~ ^[a-z]{3,}$ ]]; then
       for _known in sessions resume config undo help; do
-        _klen=${#_known}; _ilen=${#1}
-        _diff=$(( _ilen - _klen )); (( _diff < 0 )) && _diff=$(( -_diff ))
-        # match: truncation ("sess") OR same-first-3 within ±2 chars ("sesions")
-        if [[ "${_known:0:$_ilen}" == "$1" ]] \
-          || { (( _diff <= 2 )) && [[ "${_known:0:3}" == "${1:0:3}" ]]; }; then
+        if [[ ${#1} -lt ${#_known} && "${_known:0:${#1}}" == "$1" ]]; then
           echo "shoop: '$1' is not a known command — did you mean '$_known'?" >&2
           echo "  to run as a prompt: shoop \"$1\"" >&2
           exit 1
         fi
       done
-      unset _known _klen _ilen _diff
+      unset _known
     fi
     raw_input="$1"
     SESSION_SLUG=$(slugify "$raw_input")
@@ -666,6 +664,8 @@ truncate_output() {
 run_format_hook() {
   [[ -z "${FORMAT_CMD:-}" ]] && return 0
   local target="$1"
+  # FORMAT_CMD is evaluated as a shell string; trust boundary is the user-owned,
+  # chmod 600 config file. Do NOT accept FORMAT_CMD from any untrusted source.
   if bash -c "$FORMAT_CMD \"\$1\"" _ "$target" >/dev/null 2>&1; then
     result+=$'\n'"[formatted: $FORMAT_CMD]"
   fi
@@ -744,8 +744,9 @@ manage_context() {
     return 0
   fi
 
+  # Line-based cap (not byte-based: head -c mid-UTF-8 can split a multi-byte rune)
   local _old_msgs; _old_msgs=$(printf '%s' "$messages" | jq -r \
-    "[.[2:-$_keep][] | .role + \": \" + (.content // \"[tool call]\" | tostring)] | join(\"\\n\")" 2>/dev/null | head -c 8000)
+    "[.[2:-$_keep][] | .role + \": \" + (.content // \"[tool call]\" | tostring)] | join(\"\\n\")" 2>/dev/null | head -n 200)
 
   local _sum_payload; _sum_payload=$(jq -n \
     --arg model "${REWRITE_MODEL:-$MODEL}" \
@@ -816,8 +817,8 @@ $(truncate_output "$raw")"
       else
         [[ -z "$endarg" ]] && endarg=9999
         raw=$(awk -v s="$start" -v e="$endarg" 'NR>=s && NR<=e {printf "%d\t%s\n", NR, $0} NR>e {exit}' "$path" 2>&1) || true
-        total=$(wc -l < "$path" 2>/dev/null | awk '{print $1}' || echo 0)
-        _lines=$(printf '%s' "$raw" | grep -c '' 2>/dev/null || echo 0)
+        total=$(wc -l < "$path" 2>/dev/null | awk '{print $1}')
+        _lines=$(printf '%s' "$raw" | grep -c '' 2>/dev/null)
         result="[ok: $_lines lines]
 $(truncate_output "$raw")"
         if [[ "$total" -gt "$endarg" ]]; then
@@ -921,24 +922,46 @@ $(truncate_output "$raw")"
       ;;
 
     web_fetch)
-      local url fetch_timeout raw
+      local url fetch_timeout raw host
       url=$(printf '%s' "$tool_args" | jq -r '.url')
       if [[ "$url" != http://* && "$url" != https://* ]]; then
         result="[error: URL must start with http:// or https://]"
       else
-        confirm_or_skip "Fetch $url? [y/N]" "user denied fetch" || return 1
-        fetch_timeout=15
-        raw=$(run_with_timeout "$fetch_timeout" curl -sL --proto '=https,http' --max-redirs 5 --max-filesize 2097152 --max-time "$fetch_timeout" -A "shoop/$SHOOP_VERSION" "$url") || true
-        if [[ -z "$raw" ]]; then
-          result="[error: empty response from $url]"
-        elif [[ "$HAS_HTML2TEXT" = "1" ]]; then
-          raw=$(printf '%s' "$raw" | _html2text 2>/dev/null) || true
-          result="[ok: fetched $url]
-$(truncate_output "$raw")"
+        # SSRF defense: extract host and block loopback, link-local metadata,
+        # and RFC1918 private ranges. Redirect-following is kept at max 3
+        # (best-effort — curl does not re-validate redirect targets against
+        # this list, so a malicious public host could 302 to a private one).
+        host="${url#*://}"
+        host="${host%%/*}"
+        if [[ "$host" == \[* ]]; then
+          host="${host#\[}"
+          host="${host%%\]*}"
         else
-          raw=$(printf '%s' "$raw" | sed 's/<[^>]*>//g; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&nbsp;/ /g; s/&#[0-9]*;//g' | tr -s '[:space:]' | head -n 500)
-          result="[ok: fetched $url (raw — install lynx for cleaner output)]
+          host="${host%%:*}"
+        fi
+        local _blocked=0
+        case "$host" in
+          localhost|0.0.0.0|::1|fc*|fd*) _blocked=1 ;;
+          127.*|10.*|169.254.*|192.168.*) _blocked=1 ;;
+          172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) _blocked=1 ;;
+        esac
+        if (( _blocked )); then
+          result="[blocked: URL targets private/loopback/metadata address — $host]"
+        else
+          confirm_or_skip "Fetch $url? [y/N]" "user denied fetch" || return 1
+          fetch_timeout=15
+          raw=$(run_with_timeout "$fetch_timeout" curl -sL --proto '=https,http' --max-redirs 3 --max-filesize 2097152 --max-time "$fetch_timeout" -A "shoop/$SHOOP_VERSION" "$url") || true
+          if [[ -z "$raw" ]]; then
+            result="[error: empty response from $url]"
+          elif [[ "$HAS_HTML2TEXT" = "1" ]]; then
+            raw=$(printf '%s' "$raw" | _html2text 2>/dev/null) || true
+            result="[ok: fetched $url]
 $(truncate_output "$raw")"
+          else
+            raw=$(printf '%s' "$raw" | sed 's/<[^>]*>//g; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&nbsp;/ /g; s/&#[0-9]*;//g' | tr -s '[:space:]' | head -n 500)
+            result="[ok: fetched $url (raw — install lynx for cleaner output)]
+$(truncate_output "$raw")"
+          fi
         fi
       fi
       ;;
