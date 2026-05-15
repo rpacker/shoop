@@ -89,12 +89,6 @@ FORMAT_CMD="${FORMAT_CMD:-}"
 CHECKPOINT="${SHOOP_CHECKPOINT:-${CHECKPOINT:-0}}"
 [[ "$CHECKPOINT" =~ ^[0-9]$ ]] || CHECKPOINT=0
 API_KEY="${SHOOP_API_KEY:-${API_KEY:-${OPENROUTER_API_KEY:-${ZAI_API_KEY:-}}}}"
-if [[ -z "$API_KEY" ]]; then
-  echo "error: no API key found" >&2
-  echo "  add API_KEY=<key> to $CONFIG" >&2
-  echo "  or export SHOOP_API_KEY, OPENROUTER_API_KEY, or ZAI_API_KEY" >&2
-  exit 1
-fi
 
 # --- capabilities ---
 if command -v timeout >/dev/null 2>&1; then
@@ -331,6 +325,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- api ---
+require_api_key() {
+  if [[ -z "$API_KEY" ]]; then
+    echo "error: no API key found" >&2
+    echo "  add API_KEY=<key> to $CONFIG" >&2
+    echo "  or export SHOOP_API_KEY, OPENROUTER_API_KEY, or ZAI_API_KEY" >&2
+    exit 1
+  fi
+}
+
 call_api() {
   local payload="$1" resp http_code body auth_file api_error
   # auth_file holds the bearer header so the API key never appears in process args.
@@ -595,6 +598,7 @@ HELP
     fi
     raw_input="$1"
     SESSION_SLUG=$(slugify "$raw_input")
+    require_api_key
     if [ "$REWRITE" = "1" ]; then
       if enhanced=$(rewrite_prompt "$raw_input"); then
         printf '\033[2m%s\033[0m\n' "$raw_input"
@@ -613,10 +617,12 @@ HELP
     ;;
 esac
 
+require_api_key
+
 # --- git checkpoint ---
 if [[ "$CHECKPOINT" = "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  if ! git diff --quiet HEAD 2>/dev/null; then
-    if git add -u && git commit -m "shoop checkpoint $SESSION_ID" --quiet 2>/dev/null; then
+  if [[ -n "$(git status --porcelain)" ]]; then
+    if git add -A && git commit -m "shoop checkpoint $SESSION_ID" --quiet 2>/dev/null; then
       echo "  [checkpoint: committed working tree before agent run]"
     fi
   fi
@@ -697,6 +703,90 @@ run_with_timeout() {
   else
     "$@" 2>&1
   fi
+}
+
+url_host() {
+  local url="$1" host
+  host="${url#*://}"
+  host="${host%%/*}"
+  if [[ "$host" == \[* ]]; then
+    host="${host#\[}"
+    host="${host%%\]*}"
+  else
+    host="${host%%:*}"
+  fi
+  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+  printf '%s' "$host"
+}
+
+blocked_fetch_host() {
+  local host="$1"
+  case "$host" in
+    localhost|0.0.0.0|::1|fc*|fd*) return 0 ;;
+    127.*|10.*|169.254.*|192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+  esac
+  return 1
+}
+
+absolute_redirect_url() {
+  local base="$1" loc="$2" scheme authority path dir
+  loc="${loc//$'\r'/}"
+  case "$loc" in
+    http://*|https://*) printf '%s' "$loc" ;;
+    //*) scheme="${base%%://*}"; printf '%s:%s' "$scheme" "$loc" ;;
+    /*) scheme="${base%%://*}"; authority="${base#*://}"; authority="${authority%%/*}"; printf '%s://%s%s' "$scheme" "$authority" "$loc" ;;
+    *) scheme="${base%%://*}"; authority="${base#*://}"; authority="${authority%%/*}"; path="${base#*://}"; path="${path#*/}"; [[ "$path" == "$base" ]] && path=""; dir="${path%/*}"; [[ "$dir" == "$path" ]] && dir=""; printf '%s://%s/%s%s' "$scheme" "$authority" "${dir:+$dir/}" "$loc" ;;
+  esac
+}
+
+fetch_checked_url() {
+  local url="$1" fetch_timeout="$2" redirects=0 raw status headers body loc host curl_exit
+  FETCHED_BODY=""
+  while true; do
+    if [[ "$url" != http://* && "$url" != https://* ]]; then
+      result="[error: URL must start with http:// or https://]"
+      return 1
+    fi
+    host=$(url_host "$url")
+    if blocked_fetch_host "$host"; then
+      result="[blocked: URL targets private/loopback/metadata address — $host]"
+      return 1
+    fi
+
+    curl_exit=0
+    raw=$(run_with_timeout "$fetch_timeout" curl -sS -i --proto '=https,http' --max-redirs 0 --max-filesize 2097152 --max-time "$fetch_timeout" -A "shoop/$SHOOP_VERSION" "$url" 2>&1) || curl_exit=$?
+    if (( curl_exit != 0 )); then
+      result="[error: fetch failed from $url]
+$(truncate_output "$raw")"
+      return 1
+    fi
+    status=$(printf '%s' "$raw" | awk '/^HTTP\// {code=$2} END{print code}')
+    headers="${raw%%$'\r\n\r\n'*}"
+    [[ "$headers" == "$raw" ]] && headers="${raw%%$'\n\n'*}"
+    body="${raw#*$'\r\n\r\n'}"
+    [[ "$body" == "$raw" ]] && body="${raw#*$'\n\n'}"
+
+    case "$status" in
+      301|302|303|307|308)
+        if (( redirects >= 3 )); then
+          result="[error: too many redirects from $url]"
+          return 1
+        fi
+        loc=$(printf '%s\n' "$headers" | awk 'tolower($0) ~ /^location:/ {sub(/^[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*/, ""); print; exit}')
+        if [[ -z "$loc" ]]; then
+          result="[error: redirect from $url did not include Location]"
+          return 1
+        fi
+        url=$(absolute_redirect_url "$url" "$loc")
+        redirects=$((redirects + 1))
+        ;;
+      *)
+        FETCHED_BODY="$body"
+        return 0
+        ;;
+    esac
+  done
 }
 
 # safe_write <path> <content> <call_id> — TOCTOU-safe atomic write; updates _writes
@@ -922,35 +1012,17 @@ $(truncate_output "$raw")"
       ;;
 
     web_fetch)
-      local url fetch_timeout raw host
+      local url fetch_timeout raw
       url=$(printf '%s' "$tool_args" | jq -r '.url')
       if [[ "$url" != http://* && "$url" != https://* ]]; then
         result="[error: URL must start with http:// or https://]"
       else
-        # SSRF defense: extract host and block loopback, link-local metadata,
-        # and RFC1918 private ranges. Redirect-following is kept at max 3
-        # (best-effort — curl does not re-validate redirect targets against
-        # this list, so a malicious public host could 302 to a private one).
-        host="${url#*://}"
-        host="${host%%/*}"
-        if [[ "$host" == \[* ]]; then
-          host="${host#\[}"
-          host="${host%%\]*}"
-        else
-          host="${host%%:*}"
-        fi
-        local _blocked=0
-        case "$host" in
-          localhost|0.0.0.0|::1|fc*|fd*) _blocked=1 ;;
-          127.*|10.*|169.254.*|192.168.*) _blocked=1 ;;
-          172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) _blocked=1 ;;
-        esac
-        if (( _blocked )); then
-          result="[blocked: URL targets private/loopback/metadata address — $host]"
-        else
-          confirm_or_skip "Fetch $url? [y/N]" "user denied fetch" || return 1
-          fetch_timeout=15
-          raw=$(run_with_timeout "$fetch_timeout" curl -sL --proto '=https,http' --max-redirs 3 --max-filesize 2097152 --max-time "$fetch_timeout" -A "shoop/$SHOOP_VERSION" "$url") || true
+        # Redirects are followed manually so each target passes the same
+        # private/loopback host checks before curl connects.
+        confirm_or_skip "Fetch $url? [y/N]" "user denied fetch" || return 1
+        fetch_timeout=15
+        if fetch_checked_url "$url" "$fetch_timeout"; then
+          raw="$FETCHED_BODY"
           if [[ -z "$raw" ]]; then
             result="[error: empty response from $url]"
           elif [[ "$HAS_HTML2TEXT" = "1" ]]; then
