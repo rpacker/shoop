@@ -12,6 +12,7 @@ for _c in jq curl awk; do command -v "$_c" >/dev/null 2>&1 || { echo "error: $_c
 unset _c
 
 # --- Bash 3.2 shims (macOS) ---
+# shellcheck disable=SC2329
 (( BASH_VERSINFO[0] >= 4 )) || {
   mapfile() {
     local _t=0 _var=MAPFILE _i=0 _line
@@ -30,6 +31,33 @@ slugify() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | \
     sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-40
 }
+
+# --- providers ---
+PROVIDER=""
+REWRITE_MODEL=""
+
+select_provider() {
+  local name="$1"
+  PROVIDER="$name"
+  case "$name" in
+    openrouter)
+      API="https://openrouter.ai/api/v1/chat/completions"
+      MODEL="openai/gpt-5.4-mini"
+      REWRITE_MODEL=""
+      ;;
+    zai)
+      API="https://api.z.ai/api/coding/paas/v4/chat/completions"
+      MODEL="glm-5.1"
+      REWRITE_MODEL="glm-5-turbo"
+      ;;
+    *)
+      echo "error: unknown provider: $name" >&2
+      exit 1
+      ;;
+  esac
+}
+
+select_provider openrouter
 
 # --- config ---
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/shoop"
@@ -89,6 +117,7 @@ FORMAT_CMD="${FORMAT_CMD:-}"
 CHECKPOINT="${SHOOP_CHECKPOINT:-${CHECKPOINT:-0}}"
 [[ "$CHECKPOINT" =~ ^[0-9]$ ]] || CHECKPOINT=0
 API_KEY="${SHOOP_API_KEY:-${API_KEY:-${OPENROUTER_API_KEY:-${ZAI_API_KEY:-}}}}"
+RAW=0
 
 # --- capabilities ---
 if command -v timeout >/dev/null 2>&1; then
@@ -316,7 +345,8 @@ while [[ $# -gt 0 ]]; do
     --model)  _need_arg "$1" "${2:-}"; MODEL="$2"; shift 2 ;;
     --api)    _need_arg "$1" "${2:-}"; API="$2"; shift 2 ;;
     --key)    _need_arg "$1" "${2:-}"; API_KEY="$2"; shift 2 ;;
-    --zai)    API="https://api.z.ai/api/coding/paas/v4/chat/completions"; MODEL="glm-5.1"; REWRITE_MODEL="glm-5-turbo"; API_KEY="${ZAI_API_KEY:-$API_KEY}"; shift ;;
+    --zai)    select_provider zai; API_KEY="${ZAI_API_KEY:-$API_KEY}"; shift ;;
+    --raw)    RAW=1; shift ;;
     --no-rewrite)  REWRITE=0; shift ;;
     --no-confirm)  CONFIRM=0; shift ;;
     --checkpoint)  CHECKPOINT=1; shift ;;
@@ -362,6 +392,39 @@ call_api() {
   printf '%s' "$body"
 }
 
+build_chat_payload() {
+  case "$PROVIDER" in
+    openrouter|zai)
+      jq -n \
+        --arg model "$MODEL" \
+        --argjson messages "$messages" \
+        --argjson tools "$tools" \
+        '{model: $model, messages: $messages, tools: $tools, parallel_tool_calls: false}'
+      ;;
+    *)
+      echo "error: unsupported provider mode: $PROVIDER" >&2
+      exit 1
+      ;;
+  esac
+}
+
+parse_chat_response() {
+  local response_json="$1" raw_parse
+  raw_parse=$(printf '%s' "$response_json" | jq -r '
+    .choices[0].message as $m |
+    [(.usage.total_tokens // 0),
+     ($m.tool_calls // [] | length),
+     ($m.content // ""),
+     ($m | @json)] | join("\u001f")
+  ')
+  if [[ -z "$raw_parse" || "$raw_parse" != *$'\x1f'* ]]; then
+    echo "error: failed to parse API response" >&2
+    echo "$response_json" >&2
+    exit 1
+  fi
+  IFS=$'\x1f' read -d '' -r parsed_tokens parsed_tool_count parsed_content parsed_message_json _rest <<< "$raw_parse" || true
+}
+
 # --- prompt rewriter ---
 rewrite_system='Rewrite this prompt for a coding agent with tools: shell execution, file read/write/replace, grep search, directory listing, and web fetch.
 Structure as: Context (what exists), Role (expert stance), Intent (specific goal), Specs (constraints/requirements), Plan (suggested approach).
@@ -370,16 +433,21 @@ If the prompt is already specific and actionable, return it unchanged.
 No longer than 3x the original length or 200 words (whichever is smaller).
 Output the rewritten prompt only.'
 
-rewrite_prompt() {
+build_rewrite_payload() {
   local raw_prompt="$1"
-  local payload rw_resp rw_text rw_err
   local rw_model="${REWRITE_MODEL:-$MODEL}"
-  payload=$(jq -n \
+  jq -n \
     --arg model "$rw_model" \
     --arg sys "$rewrite_system" \
     --arg user "$raw_prompt" \
     '{model: $model, max_tokens: 1200,
-      messages: [{role: "system", content: $sys}, {role: "user", content: $user}]}')
+      messages: [{role: "system", content: $sys}, {role: "user", content: $user}]}'
+}
+
+rewrite_prompt() {
+  local raw_prompt="$1"
+  local payload rw_resp rw_text rw_err
+  payload=$(build_rewrite_payload "$raw_prompt")
   rw_err=$(mktemp)
   rw_resp=$(call_api "$payload" 2>"$rw_err") || { cat "$rw_err" >&2; rm -f "$rw_err"; return 1; }
   rm -f "$rw_err"
@@ -503,10 +571,10 @@ case "${1:-}" in
       SESSION_ID="${SESSION_ID%%--*}"
     fi
     messages=$(cat "$session_file")
-    echo "--- resumed $SESSION_ID (model: $MODEL) ---"
+    [[ "$RAW" != "1" ]] && echo "--- resumed $SESSION_ID (model: $MODEL) ---"
     # show last assistant message as preview
     _last=$(printf '%s' "$messages" | jq -r '[.[] | select(.role == "assistant") | .content // empty] | last // empty')
-    if [[ -n "$_last" ]]; then
+    if [[ "$RAW" != "1" && -n "$_last" ]]; then
       _last_lines=$(printf '%s' "$_last" | wc -l | tr -d ' ')
       printf '\n  last:\n%s\n' "$(printf '%s' "$_last" | head -5)"
       (( _last_lines > 5 )) && printf '  [... %d more lines]\n' "$((_last_lines - 5))"
@@ -516,15 +584,15 @@ case "${1:-}" in
       _rp=$(printf '%s' "${*:3}" | jq -Rs .)
       messages=$(printf '%s' "$messages" | jq --argjson p "$_rp" '. + [{"role":"user","content":$p}]')
     elif [[ -t 0 ]]; then
-      printf '\n'
-      read -r -p "continue> " _rp < /dev/tty || { echo ""; exit 0; }
+      [[ "$RAW" != "1" ]] && printf '\n'
+      read -r -p "continue> " _rp < /dev/tty || { [[ "$RAW" != "1" ]] && echo ""; exit 0; }
       if [[ -z "$_rp" ]]; then
         exit 0
       fi
       _rp=$(printf '%s' "$_rp" | jq -Rs .)
       messages=$(printf '%s' "$messages" | jq --argjson p "$_rp" '. + [{"role":"user","content":$p}]')
     fi
-    echo ""
+    [[ "$RAW" != "1" ]] && echo ""
     ;;
   undo|--undo)
     if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -565,6 +633,7 @@ flags:
   --api URL        API endpoint (default: from config)
   --key KEY        API key (default: from config/env)
   --zai            use z.ai coding API with ZAI_API_KEY
+  --raw            print only assistant text; useful for pipelines
   --no-rewrite     skip CRISP prompt enhancement
   --no-confirm     skip confirmation for write/replace/fetch (run_shell always confirms)
   --checkpoint     git-commit working tree before agent runs
@@ -601,9 +670,11 @@ HELP
     require_api_key
     if [ "$REWRITE" = "1" ]; then
       if enhanced=$(rewrite_prompt "$raw_input"); then
-        printf '\033[2m%s\033[0m\n' "$raw_input"
-        printf '  ↓ rewritten ↓\n'
-        printf '%s\n\n' "$enhanced"
+        if [[ "$RAW" != "1" ]]; then
+          printf '\033[2m%s\033[0m\n' "$raw_input"
+          printf '  ↓ rewritten ↓\n'
+          printf '%s\n\n' "$enhanced"
+        fi
         raw_input="$enhanced"
       else
         echo "note: prompt rewrite failed, using original" >&2
@@ -612,8 +683,10 @@ HELP
     prompt=$(printf '%s' "$raw_input" | jq -Rs .)
     system=$(printf '%s' "$system_prompt" | jq -Rs .)
     messages="[{\"role\":\"system\",\"content\":$system},{\"role\":\"user\",\"content\":$prompt}]"
-    echo "--- shoop $SESSION_ID (model: $MODEL) ---"
-    echo ""
+    if [[ "$RAW" != "1" ]]; then
+      echo "--- shoop $SESSION_ID (model: $MODEL) ---"
+      echo ""
+    fi
     ;;
 esac
 
@@ -623,7 +696,7 @@ require_api_key
 if [[ "$CHECKPOINT" = "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   if [[ -n "$(git status --porcelain)" ]]; then
     if git add -A && git commit -m "shoop checkpoint $SESSION_ID" --quiet 2>/dev/null; then
-      echo "  [checkpoint: committed working tree before agent run]"
+      [[ "$RAW" != "1" ]] && echo "  [checkpoint: committed working tree before agent run]"
     fi
   fi
 fi
@@ -640,7 +713,7 @@ feed_tool_result() {
 
 reject_tool() {
   result="$1"
-  printf '%s\n\n' "$result"
+  [[ "$RAW" != "1" ]] && printf '%s\n\n' "$result"
   feed_tool_result "$call_id" "$result"
 }
 
@@ -682,7 +755,7 @@ confirm_or_skip() {
   [[ "$CONFIRM" != "1" ]] && return 0
   if ! { true </dev/tty; } 2>/dev/null; then
     result="[$deny_msg — no terminal]"
-    printf '%s\n\n' "$result"
+    [[ "$RAW" != "1" ]] && printf '%s\n\n' "$result"
     feed_tool_result "$call_id" "$result"
     return 1
   fi
@@ -690,7 +763,7 @@ confirm_or_skip() {
   read -r -p "$prompt_text " yn < /dev/tty
   [[ "$yn" == "y" || "$yn" == "Y" ]] && return 0
   result="[$deny_msg]"
-  printf '%s\n\n' "$result"
+  [[ "$RAW" != "1" ]] && printf '%s\n\n' "$result"
   feed_tool_result "$call_id" "$result"
   return 1
 }
@@ -880,7 +953,11 @@ dispatch_tool() {
       # destructive command warning (non-blocking signal)
       case "$cmd" in
         *rm\ -rf*|*chmod\ 777*|*curl\ *|*wget\ *|*ssh\ *|*scp\ *)
-          echo "[warning: potentially destructive or network operation]" ;;
+          if [[ "$RAW" = "1" ]]; then
+            echo "[warning: potentially destructive or network operation]" >&2
+          else
+            echo "[warning: potentially destructive or network operation]"
+          fi ;;
       esac
       read -r -p "Execute? [y/N] " yn < /dev/tty
       if [[ "$yn" != "y" && "$yn" != "Y" ]]; then
@@ -926,9 +1003,17 @@ $(truncate_output "$raw")"
 
       if [[ "$CONFIRM" = "1" ]]; then
         if [[ -f "$path" ]]; then
-          diff -u "$path" <(printf '%s' "$content") 2>/dev/null || true
+          if [[ "$RAW" = "1" ]]; then
+            diff -u "$path" <(printf '%s' "$content") >&2 || true
+          else
+            diff -u "$path" <(printf '%s' "$content") 2>/dev/null || true
+          fi
         else
-          echo "[new file: $path]"
+          if [[ "$RAW" = "1" ]]; then
+            echo "[new file: $path]" >&2
+          else
+            echo "[new file: $path]"
+          fi
         fi
       fi
       confirm_or_skip "Write? [y/N]" "user denied write" || return 1
@@ -983,7 +1068,11 @@ $(truncate_output "$raw" 100)"
           result="[error: old_text not found in $path]"
         else
           if [[ "$CONFIRM" = "1" ]]; then
-            diff -u "$path" <(printf '%s' "$new_content") 2>/dev/null || true
+            if [[ "$RAW" = "1" ]]; then
+              diff -u "$path" <(printf '%s' "$new_content") >&2 || true
+            else
+              diff -u "$path" <(printf '%s' "$new_content") 2>/dev/null || true
+            fi
           fi
           confirm_or_skip "Replace? [y/N]" "user denied replace" || return 1
 
@@ -1053,32 +1142,17 @@ while true; do
     break
   fi
 
-  payload=$(jq -n \
-    --arg model "$MODEL" \
-    --argjson messages "$messages" \
-    --argjson tools "$tools" \
-    '{model: $model, messages: $messages, tools: $tools, parallel_tool_calls: false}')
+  payload=$(build_chat_payload)
   resp=$(call_api "$payload") || { echo "--- shoop aborted due to API error ---" >&2; exit 1; }
 
-  # parse response — use \x1f sentinel to avoid newline splitting multi-line content
-  _raw_parse=$(printf '%s' "$resp" | jq -r '
-    .choices[0].message as $m |
-    [(.usage.total_tokens // 0),
-     ($m.tool_calls // [] | length),
-     ($m.content // ""),
-     ($m | @json)] | join("\u001f")
-  ')
-  if [[ -z "$_raw_parse" || "$_raw_parse" != *$'\x1f'* ]]; then
-    echo "error: failed to parse API response" >&2
-    echo "$resp" >&2
-    exit 1
+  parse_chat_response "$resp"
+  total_tokens=$((total_tokens + parsed_tokens))
+  tool_count=$parsed_tool_count
+  if [[ "$RAW" != "1" ]]; then
+    printf '\n─── turn %d/%s · %s tokens ───\n' "$turn" "$MAX_TURNS" "$total_tokens"
   fi
-  IFS=$'\x1f' read -d '' -r _tok _tc _content _json _rest <<< "$_raw_parse" || true
-  total_tokens=$((total_tokens + _tok))
-  tool_count=$_tc
-  printf '\n─── turn %d/%s · %s tokens ───\n' "$turn" "$MAX_TURNS" "$total_tokens"
-  [[ -n "$_content" ]] && printf '%s\n' "$_content"
-  messages=$(printf '%s' "$messages" | jq --argjson m "$_json" '. + [$m]')
+  [[ -n "$parsed_content" ]] && printf '%s\n' "$parsed_content"
+  messages=$(printf '%s' "$messages" | jq --argjson m "$parsed_message_json" '. + [$m]')
 
   # context management: summarize old messages when window fills
   manage_context
@@ -1098,12 +1172,12 @@ while true; do
     IFS=$'\x1f' read -d '' -r tool_name call_id tool_args _rest <<< "$_raw_tool" || true
 
     _tdisp=$(printf '%s' "$tool_args" | jq -r '.command // .pattern // .path // .url // "."' 2>/dev/null | cut -c1-120)
-    printf '  [%s] %s\n' "$tool_name" "$_tdisp"
+    [[ "$RAW" != "1" ]] && printf '  [%s] %s\n' "$tool_name" "$_tdisp"
 
     result=""
     dispatch_tool "$tool_name" "$tool_args" "$call_id" || continue
 
-    printf '%s\n\n' "$result"
+    [[ "$RAW" != "1" ]] && printf '%s\n\n' "$result"
 
     feed_tool_result "$call_id" "$result"
   done
@@ -1112,9 +1186,13 @@ while true; do
   save_session
 done
 
-echo ""
-echo "--- shoop done ---"
-printf '  %d turns, %s tokens\n' "$turn" "$total_tokens"
-[[ -n "$_reads" ]] && printf '  read:%s\n' "$_reads"
-[[ -n "$_writes" ]] && printf '  wrote:%s\n' "$_writes"
-[[ $_cmds -gt 0 ]] && printf '  ran: %d commands\n' "$_cmds"
+if [[ "$RAW" != "1" ]]; then
+  echo ""
+  echo "--- shoop done ---"
+  printf '  %d turns, %s tokens\n' "$turn" "$total_tokens"
+  [[ -n "$_reads" ]] && printf '  read:%s\n' "$_reads"
+  [[ -n "$_writes" ]] && printf '  wrote:%s\n' "$_writes"
+  [[ $_cmds -gt 0 ]] && printf '  ran: %d commands\n' "$_cmds"
+fi
+
+exit 0

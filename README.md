@@ -47,6 +47,9 @@ shoop "refactor the auth package"
 # Pipe a prompt from stdin
 echo "fix the failing tests" | shoop
 
+# Raw one-shot output for scripts
+printf 'summarize this' | shoop --raw
+
 # Use a specific model
 shoop --model anthropic/claude-sonnet-4 "add input validation"
 
@@ -81,6 +84,7 @@ shoop resume "fix the bug"             # resume by prompt search
 | `--api URL` | API endpoint |
 | `--key KEY` | API key (overrides config and env) |
 | `--zai` | Use z.ai coding API with `ZAI_API_KEY` |
+| `--raw` | Print only assistant text; useful for pipelines |
 | `--no-rewrite` | Skip CRISP prompt enhancement |
 | `--no-confirm` | Skip confirmation for write/replace/fetch (`run_shell` always confirms) |
 | `--checkpoint` | Git-commit working tree before the agent runs |
