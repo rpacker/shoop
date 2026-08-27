@@ -64,45 +64,24 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/shoop"
 CONFIG="$CONFIG_DIR/config"
 SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/shoop/sessions"
 
-if [[ ! -f "$CONFIG" ]]; then
-  mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
-  cat > "$CONFIG" <<'EOF'
-MODEL=openai/gpt-5.4-mini
-API=https://openrouter.ai/api/v1/chat/completions
-API_KEY=
-MAX_TURNS=25
-CONFIRM=1
-REWRITE=1
-FORMAT_CMD=
-CHECKPOINT=0
-EOF
-  chmod 600 "$CONFIG"
-fi
-
-# migrate config: append any keys missing from older config files
-_config_defaults=(REWRITE=1 FORMAT_CMD= CHECKPOINT=0)
-for _kv in "${_config_defaults[@]}"; do
-  _k="${_kv%%=*}"
-  grep -qE "^${_k}=" "$CONFIG" 2>/dev/null || printf '%s\n' "$_kv" >> "$CONFIG"
-done
-unset _kv _k _config_defaults
-
 # safe config loading — only accept known KEY=VALUE, never source
-while IFS='=' read -r key value || [[ -n "$key" ]]; do
-  key="${key%%[[:space:]]*}"
-  value="${value#"${value%%[^[:space:]]*}"}"
-  value="${value%"${value##*[^[:space:]]}"}"
-  case "$key" in
-    MODEL) MODEL="$value" ;;
-    API) API="$value" ;;
-    API_KEY) API_KEY="$value" ;;
-    MAX_TURNS) MAX_TURNS="$value" ;;
-    CONFIRM) CONFIRM="$value" ;;
-    REWRITE) REWRITE="$value" ;;
-    FORMAT_CMD) FORMAT_CMD="$value" ;;
-    CHECKPOINT) CHECKPOINT="$value" ;;
-  esac
-done < "$CONFIG"
+if [[ -f "$CONFIG" ]]; then
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    key="${key%%[[:space:]]*}"
+    value="${value#"${value%%[^[:space:]]*}"}"
+    value="${value%"${value##*[^[:space:]]}"}"
+    case "$key" in
+      MODEL) MODEL="$value" ;;
+      API) API="$value" ;;
+      API_KEY) API_KEY="$value" ;;
+      MAX_TURNS) MAX_TURNS="$value" ;;
+      CONFIRM) CONFIRM="$value" ;;
+      REWRITE) REWRITE="$value" ;;
+      FORMAT_CMD) FORMAT_CMD="$value" ;;
+      CHECKPOINT) CHECKPOINT="$value" ;;
+    esac
+  done < "$CONFIG"
+fi
 
 # env overrides config — precedence: flag > env > config > default
 MODEL="${MODEL:-openai/gpt-5.4-mini}"
@@ -118,6 +97,31 @@ CHECKPOINT="${SHOOP_CHECKPOINT:-${CHECKPOINT:-0}}"
 [[ "$CHECKPOINT" =~ ^[0-9]$ ]] || CHECKPOINT=0
 API_KEY="${SHOOP_API_KEY:-${API_KEY:-${OPENROUTER_API_KEY:-${ZAI_API_KEY:-}}}}"
 RAW=0
+
+initialize_state() {
+  if [[ ! -f "$CONFIG" ]]; then
+    mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
+    cat > "$CONFIG" <<'EOF'
+MODEL=openai/gpt-5.4-mini
+API=https://openrouter.ai/api/v1/chat/completions
+API_KEY=
+MAX_TURNS=25
+CONFIRM=1
+REWRITE=1
+FORMAT_CMD=
+CHECKPOINT=0
+EOF
+    chmod 600 "$CONFIG"
+  fi
+
+  local kv key
+  for kv in REWRITE=1 FORMAT_CMD= CHECKPOINT=0; do
+    key="${kv%%=*}"
+    grep -qE "^${key}=" "$CONFIG" 2>/dev/null || printf '%s\n' "$kv" >> "$CONFIG"
+  done
+
+  mkdir -p "$SESSION_DIR" && chmod 700 "$SESSION_DIR"
+}
 
 # --- capabilities ---
 if command -v timeout >/dev/null 2>&1; then
@@ -202,7 +206,6 @@ is_binary() {
 }
 
 # --- session persistence ---
-mkdir -p "$SESSION_DIR" && chmod 700 "$SESSION_DIR"
 SESSION_ID=$(date +%Y%m%d-%H%M%S)-$$
 SESSION_SLUG=""
 
@@ -518,6 +521,11 @@ find_session() {
 }
 
 # --- subcommands ---
+case "${1:-}" in
+  version|--version|help|--help|-h) ;;
+  *) initialize_state ;;
+esac
+
 case "${1:-}" in
   config|--config)
     case "${2:-}" in
