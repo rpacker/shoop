@@ -17,11 +17,41 @@ file_mode() {
   stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
 }
 
-run_shoop help >/dev/null
-run_shoop --version >/dev/null
+assert_alias_output() {
+  local canonical="$1" expected alias actual
+  shift
+  expected=$(run_shoop "$canonical")
+  for alias in "$@"; do
+    actual=$(run_shoop "$alias")
+    [[ "$actual" == "$expected" ]] || {
+      echo "output for $alias does not match $canonical" >&2
+      exit 1
+    }
+  done
+}
+
+assert_alias_output version --version
+assert_alias_output help --help -h
 
 if [[ -e "$test_root/config" || -e "$test_root/data" ]]; then
   echo "informational commands initialized persistent state" >&2
+  exit 1
+fi
+
+if run_shoop version >&- 2>/dev/null; then
+  echo "stateless command unexpectedly succeeded with stdout closed" >&2
+  exit 1
+else
+  closed_stdout_status=$?
+fi
+
+[[ "$closed_stdout_status" -eq 1 ]] || {
+  echo "stateless command with stdout closed exited $closed_stdout_status, want 1" >&2
+  exit 1
+}
+
+if [[ -e "$test_root/config" || -e "$test_root/data" ]]; then
+  echo "failed stateless command initialized persistent state" >&2
   exit 1
 fi
 

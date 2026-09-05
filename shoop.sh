@@ -123,6 +123,51 @@ EOF
   mkdir -p "$SESSION_DIR" && chmod 700 "$SESSION_DIR"
 }
 
+handle_stateless_command() {
+  case "${1:-}" in
+    version|--version)
+      if echo "shoop $SHOOP_VERSION"; then
+        :
+      else
+        return 1
+      fi
+      ;;
+    help|--help|-h)
+      if cat <<HELP
+shoop $SHOOP_VERSION — a coding agent in bash
+
+usage:
+  shoop [flags] "your prompt"
+  echo "prompt" | shoop           read prompt from stdin
+  shoop resume <id> ["prompt"]    resume a saved session
+  shoop sessions                  list saved sessions
+  shoop config [show|edit]        view or edit config file
+  shoop undo                      revert the last shoop checkpoint commit
+
+flags:
+  --model NAME     model to use (current: $MODEL)
+  --api URL        API endpoint (default: from config)
+  --key KEY        API key (default: from config/env)
+  --zai            use z.ai coding API with ZAI_API_KEY
+  --raw            print only assistant text; useful for pipelines
+  --no-rewrite     skip CRISP prompt enhancement
+  --no-confirm     skip confirmation for write/replace/fetch (run_shell always confirms)
+  --checkpoint     git-commit working tree before agent runs
+  --version        show version
+
+api keys (checked in order):
+  SHOOP_API_KEY > config API_KEY > OPENROUTER_API_KEY > ZAI_API_KEY
+HELP
+      then
+        :
+      else
+        return 1
+      fi
+      ;;
+    *) return 64 ;;
+  esac
+}
+
 # --- capabilities ---
 if command -v timeout >/dev/null 2>&1; then
   TIMEOUT_CMD=timeout
@@ -195,7 +240,7 @@ check_path() {
 
 require_path() {
   local msg
-  msg=$(check_path "$1" 2>&1) || { reject_tool "${msg:-[blocked: path check failed]}"; return 1; }
+  msg=$(check_path "$1" 2>&1) || { set_tool_failure "${msg:-[blocked: path check failed]}"; return 1; }
 }
 
 is_binary() {
@@ -521,10 +566,17 @@ find_session() {
 }
 
 # --- subcommands ---
-case "${1:-}" in
-  version|--version|help|--help|-h) ;;
-  *) initialize_state ;;
-esac
+if handle_stateless_command "${1:-}"; then
+  exit 0
+else
+  stateless_status=$?
+fi
+
+if [[ "$stateless_status" -ne 64 ]]; then
+  exit "$stateless_status"
+fi
+
+initialize_state
 
 case "${1:-}" in
   config|--config)
@@ -620,38 +672,6 @@ case "${1:-}" in
     echo "checkpoint undone — working tree restored to pre-shoop state"
     exit 0
     ;;
-  version|--version)
-    echo "shoop $SHOOP_VERSION"
-    exit 0
-    ;;
-  help|--help|-h)
-    cat <<HELP
-shoop $SHOOP_VERSION — a coding agent in bash
-
-usage:
-  shoop [flags] "your prompt"
-  echo "prompt" | shoop           read prompt from stdin
-  shoop resume <id> ["prompt"]    resume a saved session
-  shoop sessions                  list saved sessions
-  shoop config [show|edit]        view or edit config file
-  shoop undo                      revert the last shoop checkpoint commit
-
-flags:
-  --model NAME     model to use (current: $MODEL)
-  --api URL        API endpoint (default: from config)
-  --key KEY        API key (default: from config/env)
-  --zai            use z.ai coding API with ZAI_API_KEY
-  --raw            print only assistant text; useful for pipelines
-  --no-rewrite     skip CRISP prompt enhancement
-  --no-confirm     skip confirmation for write/replace/fetch (run_shell always confirms)
-  --checkpoint     git-commit working tree before agent runs
-  --version        show version
-
-api keys (checked in order):
-  SHOOP_API_KEY > config API_KEY > OPENROUTER_API_KEY > ZAI_API_KEY
-HELP
-    exit 0
-    ;;
   -*)
     echo "unknown flag: $1 — run 'shoop help' for usage" >&2
     exit 1
@@ -719,10 +739,8 @@ feed_tool_result() {
     '. + [{"role":"tool","tool_call_id":$cid,"content":$r}]')
 }
 
-reject_tool() {
+set_tool_failure() {
   result="$1"
-  [[ "$RAW" != "1" ]] && printf '%s\n\n' "$result"
-  feed_tool_result "$call_id" "$result"
 }
 
 truncate_output() {
@@ -763,17 +781,65 @@ confirm_or_skip() {
   [[ "$CONFIRM" != "1" ]] && return 0
   if ! { true </dev/tty; } 2>/dev/null; then
     result="[$deny_msg — no terminal]"
-    [[ "$RAW" != "1" ]] && printf '%s\n\n' "$result"
-    feed_tool_result "$call_id" "$result"
     return 1
   fi
   local yn
   read -r -p "$prompt_text " yn < /dev/tty
   [[ "$yn" == "y" || "$yn" == "Y" ]] && return 0
   result="[$deny_msg]"
-  [[ "$RAW" != "1" ]] && printf '%s\n\n' "$result"
-  feed_tool_result "$call_id" "$result"
   return 1
+}
+
+# mutate_prepared_file <write|replace> <path> <content>
+# Owns the shared preview, confirmation, write, result, and formatting lifecycle.
+mutate_prepared_file() {
+  local operation=$1 path=$2 content=$3 prompt_text deny_msg
+  case "$operation" in
+    write)
+      prompt_text="Write? [y/N]"
+      deny_msg="user denied write"
+      ;;
+    replace)
+      prompt_text="Replace? [y/N]"
+      deny_msg="user denied replace"
+      ;;
+    *)
+      result="[error: unsupported file mutation — $operation]"
+      return 1
+      ;;
+  esac
+
+  if [[ "$CONFIRM" = "1" ]]; then
+    if [[ "$operation" = "write" && ! -f "$path" ]]; then
+      if [[ "$RAW" = "1" ]]; then
+        echo "[new file: $path]" >&2
+      else
+        echo "[new file: $path]"
+      fi
+    elif [[ "$RAW" = "1" ]]; then
+      diff -u "$path" <(printf '%s' "$content") >&2 || true
+    else
+      diff -u "$path" <(printf '%s' "$content") 2>/dev/null || true
+    fi
+  fi
+
+  confirm_or_skip "$prompt_text" "$deny_msg" || return 1
+
+  if [[ "$operation" = "write" ]]; then
+    if mkdir -p "$(dirname "$path")" 2>/dev/null; then
+      :
+    else
+      set_tool_failure "[error: unable to create parent directory for $path]"
+      return 1
+    fi
+  fi
+
+  safe_write "$path" "$content" || return 1
+  case "$operation" in
+    write) result="[ok] wrote $(( $(wc -c < "$path") )) bytes to $path" ;;
+    replace) result="[ok] replaced text in $path" ;;
+  esac
+  run_format_hook "$path"
 }
 
 # run_with_timeout <secs> <cmd> [args...] — run under timeout if available, else directly
@@ -870,17 +936,35 @@ $(truncate_output "$raw")"
   done
 }
 
-# safe_write <path> <content> <call_id> — TOCTOU-safe atomic write; updates _writes
+# safe_write <path> <content> — TOCTOU-safe atomic write; updates _writes
 safe_write() {
-  local path=$1 content=$2 call_id=$3
+  local path=$1 content=$2
   local write_target; write_target=$(resolve_path "$path")
   if [[ "$write_target" != "$WORKDIR"/* && "$write_target" != "$WORKDIR" ]]; then
-    reject_tool "[blocked: path escape — $path resolves outside workdir after write]"
+    set_tool_failure "[blocked: path escape — $path resolves outside workdir after write]"
     return 1
   fi
-  local tmp; tmp=$(mktemp "$(dirname "$write_target")/.shoop-XXXXXX")
-  printf '%s' "$content" > "$tmp"
-  mv "$tmp" "$write_target"
+  local tmp
+  if tmp=$(mktemp "$(dirname "$write_target")/.shoop-XXXXXX" 2>/dev/null); then
+    :
+  else
+    set_tool_failure "[error: unable to create temporary file for $path]"
+    return 1
+  fi
+  if printf '%s' "$content" > "$tmp" 2>/dev/null; then
+    :
+  else
+    rm -f "$tmp" || true
+    set_tool_failure "[error: unable to write $path]"
+    return 1
+  fi
+  if mv "$tmp" "$write_target" 2>/dev/null; then
+    :
+  else
+    rm -f "$tmp" || true
+    set_tool_failure "[error: unable to finalize write for $path]"
+    return 1
+  fi
   _writes="$_writes $path"
 }
 
@@ -943,7 +1027,7 @@ manage_context() {
   fi
 }
 
-# dispatch_tool <tool_name> <tool_args_json> <call_id> — execute tool; sets $result; returns 1 if rejected
+# dispatch_tool <tool_name> <tool_args_json> <call_id> — execute tool; sets $result; returns 1 on failure
 dispatch_tool() {
   local tool_name=$1 tool_args=$2 call_id=$3
 
@@ -956,7 +1040,7 @@ dispatch_tool() {
       (( cmd_timeout > 300 )) && cmd_timeout=300
       # run_shell ALWAYS requires confirmation — too dangerous to skip
       if ! { true </dev/tty; } 2>/dev/null; then
-        reject_tool "[blocked: no /dev/tty — run_shell needs an interactive terminal for confirmation]"; return 1
+        set_tool_failure "[blocked: no /dev/tty — run_shell needs an interactive terminal for confirmation]"; return 1
       fi
       # destructive command warning (non-blocking signal)
       case "$cmd" in
@@ -969,7 +1053,7 @@ dispatch_tool() {
       esac
       read -r -p "Execute? [y/N] " yn < /dev/tty
       if [[ "$yn" != "y" && "$yn" != "Y" ]]; then
-        reject_tool "[user denied execution]"; return 1
+        set_tool_failure "[user denied execution]"; return 1
       fi
       exit_code=0
       raw=$(run_with_timeout "$cmd_timeout" bash -c "$cmd") || exit_code=$?
@@ -1008,29 +1092,7 @@ $(truncate_output "$raw")"
       path=$(printf '%s' "$tool_args" | jq -r '.path')
       require_path "$path" || return 1
       content=$(printf '%s' "$tool_args" | jq -r '.content')
-
-      if [[ "$CONFIRM" = "1" ]]; then
-        if [[ -f "$path" ]]; then
-          if [[ "$RAW" = "1" ]]; then
-            diff -u "$path" <(printf '%s' "$content") >&2 || true
-          else
-            diff -u "$path" <(printf '%s' "$content") 2>/dev/null || true
-          fi
-        else
-          if [[ "$RAW" = "1" ]]; then
-            echo "[new file: $path]" >&2
-          else
-            echo "[new file: $path]"
-          fi
-        fi
-      fi
-      confirm_or_skip "Write? [y/N]" "user denied write" || return 1
-
-      mkdir -p "$(dirname "$path")"
-
-      safe_write "$path" "$content" "$call_id" || return 1
-      result="[ok] wrote $(( $(wc -c < "$path") )) bytes to $path"
-      run_format_hook "$path"
+      mutate_prepared_file write "$path" "$content" || return 1
       ;;
 
     search_files)
@@ -1075,18 +1137,7 @@ $(truncate_output "$raw" 100)"
         ' < "$path" 2>&1); then
           result="[error: old_text not found in $path]"
         else
-          if [[ "$CONFIRM" = "1" ]]; then
-            if [[ "$RAW" = "1" ]]; then
-              diff -u "$path" <(printf '%s' "$new_content") >&2 || true
-            else
-              diff -u "$path" <(printf '%s' "$new_content") 2>/dev/null || true
-            fi
-          fi
-          confirm_or_skip "Replace? [y/N]" "user denied replace" || return 1
-
-          safe_write "$path" "$new_content" "$call_id" || return 1
-          result="[ok] replaced text in $path"
-          run_format_hook "$path"
+          mutate_prepared_file replace "$path" "$new_content" || return 1
         fi
       fi
       ;;
@@ -1183,10 +1234,13 @@ while true; do
     [[ "$RAW" != "1" ]] && printf '  [%s] %s\n' "$tool_name" "$_tdisp"
 
     result=""
-    dispatch_tool "$tool_name" "$tool_args" "$call_id" || continue
+    if dispatch_tool "$tool_name" "$tool_args" "$call_id"; then
+      :
+    elif [[ -z "$result" ]]; then
+      result="[error: tool failed without a result]"
+    fi
 
     [[ "$RAW" != "1" ]] && printf '%s\n\n' "$result"
-
     feed_tool_result "$call_id" "$result"
   done
 
